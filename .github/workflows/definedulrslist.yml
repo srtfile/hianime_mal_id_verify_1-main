@@ -1,0 +1,218 @@
+name: Anime Scraper — Defined URLs
+
+on:
+  workflow_dispatch:   # manual trigger only; no inputs needed
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+
+      # ── Fetch the real remote master JSON, look up each slug from
+      #    defined_urls_list.txt, and carry over the real numeric id + title.
+      #    Slugs not found in the master list are written to a separate
+      #    /tmp/slug_not_found.txt so they can be committed later.
+      - name: Build master JSON from defined_urls_list.txt
+        run: |
+          python - << 'PYEOF'
+          import json, re, sys
+          import requests as req
+
+          REMOTE_URL = "https://raw.githubusercontent.com/srtfile/hianime.ad/refs/heads/main/data/anime_urls.json"
+
+          # 1. Read defined URLs → slugs
+          with open("defined_urls_list.txt") as f:
+              urls = [u.strip() for u in f if u.strip().startswith("http")]
+
+          defined_slugs = []
+          for url in urls:
+              slug = re.sub(r"https?://[^/]+/anime/", "", url).strip("/")
+              defined_slugs.append(slug)
+
+          print(f"Defined slugs ({len(defined_slugs)}): {defined_slugs}")
+
+          # 2. Fetch remote master list
+          print("Fetching remote master list...")
+          r = req.get(REMOTE_URL, timeout=30)
+          r.raise_for_status()
+          master = r.json().get("anime", [])
+          print(f"Remote master has {len(master)} entries.")
+
+          # 3. Build slug → full entry lookup
+          slug_lookup = {entry["slug"]: entry for entry in master if entry.get("slug")}
+
+          # 4. Separate found vs not-found slugs
+          entries        = []   # goes into /tmp/defined_master.json
+          not_found_urls = []   # goes into /tmp/slug_not_found.txt
+
+          for slug in defined_slugs:
+              if slug in slug_lookup:
+                  entries.append(slug_lookup[slug])
+                  print(f"  [found]   {slug!r}  id={slug_lookup[slug].get('id')}")
+              else:
+                  not_found_urls.append(f"https://hianime.ad/anime/{slug}")
+                  print(f"  [missing] {slug!r}  — not in master list")
+
+          # 5. Write the filtered master (only found slugs — scraper gets real IDs)
+          with open("/tmp/defined_master.json", "w", encoding="utf-8") as f:
+              json.dump({"anime": entries}, f, ensure_ascii=False, indent=2)
+          print(f"\nWrote /tmp/defined_master.json  ({len(entries)} entries)")
+
+          # 6. Write not-found slugs to a temp file for the commit step
+          with open("/tmp/slug_not_found.txt", "w", encoding="utf-8") as f:
+              f.write("\n".join(not_found_urls) + ("\n" if not_found_urls else ""))
+          print(f"Wrote /tmp/slug_not_found.txt  ({len(not_found_urls)} missing slugs)")
+
+          # 7. Export count of FOUND slugs so the index range step uses it
+          with open("/tmp/found_count.txt", "w") as f:
+              f.write(str(len(entries)))
+          PYEOF
+
+      # ── Monkey-patch requests.get inside anime_scraper.py so the one
+      #    call that fetches GITHUB_JSON is served from our local filtered
+      #    file. Every other network call passes through untouched.
+      - name: Patch anime_scraper.py to use local master JSON
+        run: |
+          python - << 'PYEOF'
+          PATCH = '''
+          # ── DEFINED-URLS PATCH (injected by scrape_defined_urls.yml) ──
+          import json as _json, requests as _requests
+
+          _GITHUB_JSON  = "https://raw.githubusercontent.com/srtfile/hianime.ad/refs/heads/main/data/anime_urls.json"
+          _LOCAL_MASTER = "/tmp/defined_master.json"
+          _real_get     = _requests.get
+
+          class _FakeResponse:
+              status_code = 200
+              def raise_for_status(self): pass
+              def json(self):
+                  with open(_LOCAL_MASTER, encoding="utf-8") as _f:
+                      return _json.load(_f)
+
+          def _patched_get(url, **kwargs):
+              if url == _GITHUB_JSON:
+                  print(f"[PATCH] Intercepted master-list fetch — serving {_LOCAL_MASTER}")
+                  return _FakeResponse()
+              return _real_get(url, **kwargs)
+
+          _requests.get = _patched_get
+          # ── END PATCH ──
+          '''
+
+          import re
+          with open("anime_scraper.py", "r", encoding="utf-8") as f:
+              src = f.read()
+
+          insert_at = re.search(r"^(?!import |from |\s*#).", src, re.MULTILINE).start()
+          patched   = src[:insert_at] + PATCH.lstrip("\n") + "\n" + src[insert_at:]
+
+          with open("anime_scraper.py", "w", encoding="utf-8") as f:
+              f.write(patched)
+
+          print("Patch applied to anime_scraper.py")
+          PYEOF
+
+      - name: Set index range (found slugs only)
+        id: url_range
+        run: |
+          COUNT=$(cat /tmp/found_count.txt)
+          echo "end_index=$COUNT" >> $GITHUB_OUTPUT
+          echo "Will process $COUNT URLs (indices 0 – $((COUNT - 1)))"
+
+      - name: Run scraper
+        env:
+          START_INDEX:        "0"
+          END_INDEX:          ${{ steps.url_range.outputs.end_index }}
+          GITHUB_TOKEN:       ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY:  ${{ github.repository }}
+          GITHUB_REF_NAME:    ${{ github.ref_name }}
+        run: python anime_scraper.py
+
+      # ── Commit slug_not_found.txt to the repo (append-only, deduped).
+      #    Only runs if /tmp/slug_not_found.txt is non-empty.
+      - name: Commit slug_not_found.txt
+        env:
+          GITHUB_TOKEN:       ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY:  ${{ github.repository }}
+          GITHUB_REF_NAME:    ${{ github.ref_name }}
+        run: |
+          python - << 'PYEOF'
+          import os, base64, requests, json
+
+          NOT_FOUND_FILE = "/tmp/slug_not_found.txt"
+          REPO_PATH      = "data/slug_not_found.txt"
+
+          with open(NOT_FOUND_FILE, encoding="utf-8") as f:
+              new_lines = [l.strip() for l in f if l.strip()]
+
+          if not new_lines:
+              print("No missing slugs — skipping slug_not_found.txt commit.")
+              raise SystemExit(0)
+
+          GH_TOKEN  = os.environ["GITHUB_TOKEN"]
+          GH_REPO   = os.environ["GITHUB_REPOSITORY"]
+          GH_BRANCH = os.environ["GITHUB_REF_NAME"]
+          GH_API    = "https://api.github.com"
+
+          headers = {
+              "Authorization": f"Bearer {GH_TOKEN}",
+              "Accept":        "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2022-11-28",
+          }
+
+          # Download existing file (if any) and merge — deduped, append-only
+          url = f"{GH_API}/repos/{GH_REPO}/contents/{REPO_PATH}"
+          r   = requests.get(url, headers=headers, params={"ref": GH_BRANCH})
+
+          existing_lines = []
+          sha = None
+          if r.status_code == 200:
+              data           = r.json()
+              sha            = data.get("sha")
+              raw            = base64.b64decode(data.get("content", "")).decode("utf-8")
+              existing_lines = [l.strip() for l in raw.splitlines() if l.strip()]
+
+          seen     = set(existing_lines)
+          combined = list(existing_lines)
+          added    = 0
+          for line in new_lines:
+              if line not in seen:
+                  seen.add(line)
+                  combined.append(line)
+                  added += 1
+
+          if added == 0:
+              print("All missing slugs already recorded — nothing new to commit.")
+              raise SystemExit(0)
+
+          content_str = "\n".join(combined) + "\n"
+          payload = {
+              "message": f"track: add {added} slug(s) not found in master list",
+              "content": base64.b64encode(content_str.encode("utf-8")).decode("ascii"),
+              "branch":  GH_BRANCH,
+          }
+          if sha:
+              payload["sha"] = sha
+
+          rc = requests.put(url, headers=headers, json=payload)
+          if rc.status_code in (200, 201):
+              print(f"✓ Committed {REPO_PATH}  (+{added} new slug(s))")
+              for line in new_lines:
+                  print(f"  {line}")
+          else:
+              print(f"✗ Failed to commit {REPO_PATH}: {rc.status_code} {rc.text[:300]}")
+              raise SystemExit(1)
+          PYEOF
