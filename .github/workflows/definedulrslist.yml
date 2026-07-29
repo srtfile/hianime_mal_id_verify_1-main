@@ -21,10 +21,98 @@ jobs:
       - name: Install dependencies
         run: pip install requests beautifulsoup4
 
+      # ── Validate and repair all existing JSON files in data/ before the
+      #    scraper runs so we never accumulate into a broken file.
+      - name: Validate and repair existing JSON files in data/
+        run: |
+          python - << 'PYEOF'
+          import json, os, re, sys
+
+          DATA_DIR = "data"
+
+          def repair_json(text: str, path: str) -> list | None:
+              text = text.lstrip("\ufeff").strip()
+              if not text:
+                  return []
+              try:
+                  parsed = json.loads(text)
+                  return parsed if isinstance(parsed, list) else ([parsed] if isinstance(parsed, dict) else None)
+              except json.JSONDecodeError:
+                  pass
+              repaired = re.sub(r",\s*([\]}])", r"\1", text)
+              try:
+                  parsed = json.loads(repaired)
+                  print(f"  [repair] {path}: fixed trailing commas.")
+                  return parsed if isinstance(parsed, list) else [parsed]
+              except json.JSONDecodeError:
+                  pass
+              if text.startswith("{"):
+                  try:
+                      parsed = json.loads(f"[{repaired}]")
+                      if isinstance(parsed, list):
+                          print(f"  [repair] {path}: wrapped bare object in list.")
+                          return parsed
+                  except json.JSONDecodeError:
+                      pass
+              last_bracket = text.rfind("]")
+              if last_bracket > 0:
+                  candidate = re.sub(r",\s*\]$", "]", text[:last_bracket + 1].rstrip())
+                  try:
+                      parsed = json.loads(candidate)
+                      if isinstance(parsed, list):
+                          print(f"  [repair] {path}: truncated to last ']' — recovered {len(parsed)} entries.")
+                          return parsed
+                  except json.JSONDecodeError:
+                      pass
+              return None
+
+          if not os.path.isdir(DATA_DIR):
+              print(f"No {DATA_DIR}/ directory — nothing to validate.")
+              sys.exit(0)
+
+          json_files = [f for f in os.listdir(DATA_DIR) if f.endswith(".json")]
+          if not json_files:
+              print(f"No JSON files found in {DATA_DIR}/.")
+              sys.exit(0)
+
+          errors = 0
+          for fname in sorted(json_files):
+              fpath = os.path.join(DATA_DIR, fname)
+              with open(fpath, encoding="utf-8") as f:
+                  raw = f.read()
+              try:
+                  parsed = json.loads(raw.lstrip("\ufeff").strip())
+                  if isinstance(parsed, list):
+                      print(f"  [ok] {fname}  ({len(parsed)} entries)")
+                      continue
+              except json.JSONDecodeError:
+                  pass
+              print(f"  [broken] {fname} — attempting repair...")
+              repaired_data = repair_json(raw, fname)
+              if repaired_data is None:
+                  print(f"  [ERROR] {fname}: could not repair — leaving file untouched.")
+                  errors += 1
+                  continue
+              fixed_text = json.dumps(repaired_data, indent=4, ensure_ascii=False)
+              try:
+                  json.loads(fixed_text)
+              except json.JSONDecodeError as e:
+                  print(f"  [ERROR] {fname}: repaired output is still invalid: {e}")
+                  errors += 1
+                  continue
+              with open(fpath, "w", encoding="utf-8") as f:
+                  f.write(fixed_text)
+              print(f"  [fixed] {fname} — wrote {len(repaired_data)} entries.")
+          if errors:
+              print(f"\n{errors} file(s) could not be repaired.")
+          else:
+              print("\nAll JSON files are valid.")
+          PYEOF
+
       # ── Fetch the real remote master JSON, look up each slug from
       #    defined_urls_list.txt, and carry over the real numeric id + title.
       #    Slugs not found in the master list are written to a separate
-      #    /tmp/slug_not_found.txt so they can be committed later.
+      #    /tmp/slug_not_found.txt so they can be committed later to data/.
       - name: Build master JSON from defined_urls_list.txt
         run: |
           python - << 'PYEOF'
@@ -56,7 +144,7 @@ jobs:
 
           # 4. Separate found vs not-found slugs
           entries        = []   # goes into /tmp/defined_master.json
-          not_found_urls = []   # goes into /tmp/slug_not_found.txt
+          not_found_urls = []   # goes into data/slug_not_found.txt (via /tmp)
 
           for slug in defined_slugs:
               if slug in slug_lookup:
@@ -72,6 +160,7 @@ jobs:
           print(f"\nWrote /tmp/defined_master.json  ({len(entries)} entries)")
 
           # 6. Write not-found slugs to a temp file for the commit step
+          #    Final destination: data/slug_not_found.txt
           with open("/tmp/slug_not_found.txt", "w", encoding="utf-8") as f:
               f.write("\n".join(not_found_urls) + ("\n" if not_found_urls else ""))
           print(f"Wrote /tmp/slug_not_found.txt  ({len(not_found_urls)} missing slugs)")
@@ -134,16 +223,32 @@ jobs:
 
       - name: Run scraper
         env:
-          START_INDEX:        "0"
+          START_INDEX:        "1"
           END_INDEX:          ${{ steps.url_range.outputs.end_index }}
           GITHUB_TOKEN:       ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY:  ${{ github.repository }}
           GITHUB_REF_NAME:    ${{ github.ref_name }}
         run: python anime_scraper.py
 
-      # ── Commit slug_not_found.txt to the repo (append-only, deduped).
+      # ── Commit repaired JSON files (if any were fixed in the validation step).
+      - name: Commit repaired JSON files (if any)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/*.json 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "No repaired JSON files to commit."
+          else
+            git commit -m "fix: repair malformed JSON files in data/"
+            git push
+          fi
+
+      # ── Commit data/slug_not_found.txt to the repo (append-only, deduped).
       #    Only runs if /tmp/slug_not_found.txt is non-empty.
-      - name: Commit slug_not_found.txt
+      #    File is stored inside data/ alongside all other output files.
+      - name: Commit data/slug_not_found.txt
         env:
           GITHUB_TOKEN:       ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY:  ${{ github.repository }}
@@ -153,13 +258,13 @@ jobs:
           import os, base64, requests, json
 
           NOT_FOUND_FILE = "/tmp/slug_not_found.txt"
-          REPO_PATH      = "data/slug_not_found.txt"
+          REPO_PATH      = "data/slug_not_found.txt"   # always inside data/
 
           with open(NOT_FOUND_FILE, encoding="utf-8") as f:
               new_lines = [l.strip() for l in f if l.strip()]
 
           if not new_lines:
-              print("No missing slugs — skipping slug_not_found.txt commit.")
+              print("No missing slugs — skipping data/slug_not_found.txt commit.")
               raise SystemExit(0)
 
           GH_TOKEN  = os.environ["GITHUB_TOKEN"]
