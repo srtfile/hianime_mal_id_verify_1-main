@@ -4,12 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       start_index:
-        description: "Start index (inclusive) — e.g. 0"
+        description: "Start index (1-based, inclusive) — e.g. 1"
         required: true
-        default: "0"
+        default: "1"
         type: string
       end_index:
-        description: "End index (exclusive) — e.g. 100 processes items 0–99"
+        description: "End index (1-based, inclusive) — e.g. 100 processes items 1–100"
         required: true
         default: "20"
         type: string
@@ -32,6 +32,115 @@ jobs:
       - name: Install dependencies
         run: pip install requests beautifulsoup4
 
+      # ── Validate and repair all existing JSON files in data/ before the
+      #    scraper runs so we never accumulate into a broken file.
+      - name: Validate and repair existing JSON files in data/
+        run: |
+          python - << 'PYEOF'
+          import json, os, re, sys
+
+          DATA_DIR = "data"
+
+          def repair_json(text: str, path: str) -> list | None:
+              """
+              Attempt to parse text as a JSON array.
+              Returns the parsed list on success, or None if unrecoverable.
+              """
+              text = text.lstrip("\ufeff").strip()
+              if not text:
+                  return []
+
+              # Fast path
+              try:
+                  parsed = json.loads(text)
+                  return parsed if isinstance(parsed, list) else ([parsed] if isinstance(parsed, dict) else None)
+              except json.JSONDecodeError:
+                  pass
+
+              # Repair: remove trailing commas
+              repaired = re.sub(r",\s*([\]}])", r"\1", text)
+              try:
+                  parsed = json.loads(repaired)
+                  print(f"  [repair] {path}: fixed trailing commas.")
+                  return parsed if isinstance(parsed, list) else [parsed]
+              except json.JSONDecodeError:
+                  pass
+
+              # Repair: wrap bare object
+              if text.startswith("{"):
+                  try:
+                      parsed = json.loads(f"[{repaired}]")
+                      if isinstance(parsed, list):
+                          print(f"  [repair] {path}: wrapped bare object in list.")
+                          return parsed
+                  except json.JSONDecodeError:
+                      pass
+
+              # Repair: truncate to last complete ]
+              last_bracket = text.rfind("]")
+              if last_bracket > 0:
+                  candidate = re.sub(r",\s*\]$", "]", text[:last_bracket + 1].rstrip())
+                  try:
+                      parsed = json.loads(candidate)
+                      if isinstance(parsed, list):
+                          print(f"  [repair] {path}: truncated to last ']' — recovered {len(parsed)} entries.")
+                          return parsed
+                  except json.JSONDecodeError:
+                      pass
+
+              return None
+
+          if not os.path.isdir(DATA_DIR):
+              print(f"No {DATA_DIR}/ directory found — nothing to validate.")
+              sys.exit(0)
+
+          json_files = [f for f in os.listdir(DATA_DIR) if f.endswith(".json")]
+          if not json_files:
+              print(f"No JSON files found in {DATA_DIR}/.")
+              sys.exit(0)
+
+          errors = 0
+          for fname in sorted(json_files):
+              fpath = os.path.join(DATA_DIR, fname)
+              with open(fpath, encoding="utf-8") as f:
+                  raw = f.read()
+
+              try:
+                  parsed = json.loads(raw.lstrip("\ufeff").strip())
+                  if isinstance(parsed, list):
+                      print(f"  [ok] {fname}  ({len(parsed)} entries)")
+                      continue
+              except json.JSONDecodeError:
+                  pass
+
+              print(f"  [broken] {fname} — attempting repair...")
+              repaired_data = repair_json(raw, fname)
+
+              if repaired_data is None:
+                  print(f"  [ERROR] {fname}: could not repair — leaving file untouched.")
+                  errors += 1
+                  continue
+
+              fixed_text = json.dumps(repaired_data, indent=4, ensure_ascii=False)
+              # Validate the fixed output
+              try:
+                  json.loads(fixed_text)
+              except json.JSONDecodeError as e:
+                  print(f"  [ERROR] {fname}: repaired output is still invalid: {e}")
+                  errors += 1
+                  continue
+
+              with open(fpath, "w", encoding="utf-8") as f:
+                  f.write(fixed_text)
+              print(f"  [fixed] {fname} — wrote {len(repaired_data)} entries.")
+
+          if errors:
+              print(f"\n{errors} file(s) could not be repaired. Check logs above.")
+              # Do not block the workflow — the scraper will skip broken files gracefully.
+          else:
+              print("\nAll JSON files are valid.")
+          PYEOF
+
       - name: Run scraper
         env:
           START_INDEX:         ${{ github.event.inputs.start_index }}
@@ -40,3 +149,19 @@ jobs:
           GITHUB_REPOSITORY:   ${{ github.repository }}
           GITHUB_REF_NAME:     ${{ github.ref_name }}
         run: python anime_scraper.py
+
+      # ── Commit any JSON files that were repaired in the validation step.
+      #    (Only runs if git detects changes in data/*.json.)
+      - name: Commit repaired JSON files (if any)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/*.json 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "No repaired JSON files to commit."
+          else
+            git commit -m "fix: repair malformed JSON files in data/"
+            git push
+          fi
