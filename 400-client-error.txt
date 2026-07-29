@@ -1,0 +1,3 @@
+hianime_url: https://hianime.ad/anime/nana-2006
+query: 'ナナ'
+    [api-error] 400 Client Error: Bad Request for url: https://api.myanimelist.net/v2/anime?q=%E3%83%8A%E3%83%8A&limit=10&fields=id%2Ctitle%2Calternative_titles%2Cmedia_type%2Cnum_episodes%2Cstatus%2Cstart_date
