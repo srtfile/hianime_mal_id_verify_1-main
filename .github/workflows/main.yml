@@ -1,0 +1,42 @@
+name: Anime Scraper
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_index:
+        description: "Start index (inclusive) — e.g. 0"
+        required: true
+        default: "0"
+        type: string
+      end_index:
+        description: "End index (exclusive) — e.g. 100 processes items 0–99"
+        required: true
+        default: "20"
+        type: string
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # allows GITHUB_TOKEN to commit files
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Run scraper
+        env:
+          START_INDEX:         ${{ github.event.inputs.start_index }}
+          END_INDEX:           ${{ github.event.inputs.end_index }}
+          GITHUB_TOKEN:        ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY:   ${{ github.repository }}
+          GITHUB_REF_NAME:     ${{ github.ref_name }}
+        run: python anime_scraper.py
