@@ -3,7 +3,7 @@ anime_scraper.py — GitHub Actions version
 
 Reads START_INDEX and END_INDEX from environment variables (set via workflow_dispatch inputs).
 Scrapes HiAnime, finds MAL IDs, accumulates output into a single JSON file until it reaches
-5 MB (then and only then starts a new chunk), and commits everything to the repo.
+3 MB (then and only then starts a new chunk), and commits everything to the repo.
 
 Extra files committed each run:
   data/already_processed_urls.txt  — one HiAnime URL per line (append-only, deduped)
@@ -12,6 +12,12 @@ Extra files committed each run:
                                      The HiAnime URL that triggered each 400 is stored on
                                      the first line of every block so those entries are also
                                      SKIPPED on future runs.
+
+Output files:
+  data/anime_data.json             — verified MAL-matched entries  (≤ 3 MB per file)
+  data/anime_data_part2.json       — overflow, part 2  (etc.)
+  data/unverified_mal_id.json      — unverified/partial entries    (≤ 3 MB per file)
+  data/unverified_mal_id_part2.json
 """
 
 import json, time, re, os, sys, base64, requests
@@ -44,8 +50,9 @@ DEFAULT_BATCH = 100   # URLs to process in auto mode
 START_ITEM = max(1, _START_RAW_INT) if not AUTO_MODE else 1
 END_ITEM   = _END_RAW_INT           if not AUTO_MODE else DEFAULT_BATCH
 
-MAX_MB       = 10
-MAX_BYTES    = MAX_MB * 1024 * 1024          # 5 242 880 bytes
+# ── File-size limit ──────────────────────────────────────────────
+MAX_MB    = 3                        # maximum megabytes per output file
+MAX_BYTES = MAX_MB * 1024 * 1024     # 3 145 728 bytes
 
 GITHUB_JSON  = "https://raw.githubusercontent.com/srtfile/hianime.ad/refs/heads/main/data/anime_urls.json"
 OUTPUT_DIR   = "data"   # folder inside repo where all output files are saved
@@ -56,7 +63,7 @@ GH_REPO      = os.environ.get("GITHUB_REPOSITORY", "")   # e.g. "owner/repo"
 GH_BRANCH    = os.environ.get("GITHUB_REF_NAME", "main")
 GH_API       = "https://api.github.com"
 
-# Tracking file paths (relative to repo root)
+# Tracking file paths (relative to repo root — always inside OUTPUT_DIR)
 PROCESSED_URLS_PATH = f"{OUTPUT_DIR}/already_processed_urls.txt"
 BAD_REQUEST_PATH    = f"{OUTPUT_DIR}/400-client-error.txt"
 
@@ -64,6 +71,96 @@ BAD_REQUEST_PATH    = f"{OUTPUT_DIR}/400-client-error.txt"
 OUTPUT_BASENAME            = "anime_data"
 # Unverified (partial / no-match) entries go into a separate file series
 OUTPUT_BASENAME_UNVERIFIED = "unverified_mal_id"
+
+
+# ═══════════════════════════════════════════════════════════════
+#  JSON helpers — validate and repair
+# ═══════════════════════════════════════════════════════════════
+
+def safe_json_loads(raw: str, context: str = "") -> list:
+    """
+    Parse raw text as a JSON array.
+    • Strips BOM and leading/trailing whitespace.
+    • If json.loads fails, attempts a best-effort repair:
+        - Removes trailing commas before ] or }
+        - Wraps bare object in [ ] if needed
+    Returns a list (empty on unrecoverable error).
+    """
+    if not raw:
+        return []
+
+    text = raw.lstrip("\ufeff").strip()   # strip BOM + whitespace
+
+    # Fast path
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            return parsed
+        if isinstance(parsed, dict):
+            # Some files were accidentally saved as a single object
+            print(f"  [json] {context}: root is object, wrapping in list.")
+            return [parsed]
+        print(f"  [json] {context}: unexpected root type {type(parsed)}, returning [].")
+        return []
+    except json.JSONDecodeError as first_err:
+        pass
+
+    # Repair attempt 1 — remove trailing commas inside arrays/objects
+    repaired = re.sub(r",\s*([\]}])", r"\1", text)
+    try:
+        parsed = json.loads(repaired)
+        if isinstance(parsed, list):
+            print(f"  [json-repair] {context}: fixed trailing commas.")
+            return parsed
+        if isinstance(parsed, dict):
+            print(f"  [json-repair] {context}: fixed trailing commas + wrapped object in list.")
+            return [parsed]
+    except json.JSONDecodeError:
+        pass
+
+    # Repair attempt 2 — wrap in array if text looks like a bare object
+    if text.startswith("{"):
+        try:
+            parsed = json.loads(f"[{repaired}]")
+            if isinstance(parsed, list):
+                print(f"  [json-repair] {context}: wrapped bare object in list.")
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    # Repair attempt 3 — truncate to last complete element
+    last_bracket = text.rfind("]")
+    if last_bracket > 0:
+        candidate = text[:last_bracket + 1]
+        # Remove trailing comma before ]
+        candidate = re.sub(r",\s*\]$", "]", candidate.rstrip())
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, list):
+                print(f"  [json-repair] {context}: truncated to last complete ] — "
+                      f"recovered {len(parsed)} entries (original text may have been truncated).")
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    print(f"  [json-error] {context}: could not parse or repair JSON. Returning [].")
+    return []
+
+
+def safe_json_dumps(data: list) -> str:
+    """
+    Serialise a list to a well-formed, UTF-8 JSON string (indent=4).
+    Validates the round-trip to catch any serialisation issues.
+    """
+    out = json.dumps(data, indent=4, ensure_ascii=False)
+    # Validate round-trip
+    try:
+        json.loads(out)
+    except json.JSONDecodeError as e:
+        # Should never happen with standard data, but guard anyway
+        raise RuntimeError(f"safe_json_dumps produced invalid JSON: {e}") from e
+    return out
+
 
 # ═══════════════════════════════════════════════════════════════
 #  STEP 1 — HiAnime scraper
@@ -536,15 +633,16 @@ def find_mal_id(local: dict, bad_request_entries: list) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  STEP 3 — Accumulate into ≤5 MB chunks
+#  STEP 3 — Accumulate into ≤ 3 MB chunks
 #
 #  Strategy:
 #    - All runs share a single fixed filename: anime_data.json
 #    - When the latest chunk file exists in the repo, download it
 #      and APPEND new entries to it.
 #    - Only start anime_data_part2.json (etc.) when the combined
-#      content would exceed MAX_BYTES (5 MB).
+#      content would exceed MAX_BYTES (3 MB).
 #    - Never create a new file just because it's a new run.
+#    - JSON is validated/repaired on every read and write.
 # ═══════════════════════════════════════════════════════════════
 
 def list_existing_chunk_files(basename: str = OUTPUT_BASENAME) -> list[tuple[int, str]]:
@@ -575,15 +673,15 @@ def list_existing_chunk_files(basename: str = OUTPUT_BASENAME) -> list[tuple[int
 
 
 def fetch_existing_chunk(repo_path: str) -> list:
-    """Download and parse the JSON array from an existing chunk file. Returns [] on error."""
+    """
+    Download and parse the JSON array from an existing chunk file.
+    Uses safe_json_loads for validation/repair.
+    Returns [] on error or empty file.
+    """
     raw = fetch_remote_text(repo_path)
     if not raw.strip():
         return []
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError as e:
-        print(f"  Warning: could not parse existing chunk {repo_path}: {e}")
-        return []
+    return safe_json_loads(raw, context=repo_path)
 
 
 def chunk_path_for_part(part: int, basename: str = OUTPUT_BASENAME) -> str:
@@ -596,11 +694,11 @@ def chunk_path_for_part(part: int, basename: str = OUTPUT_BASENAME) -> str:
 def accumulate_and_split(new_entries: list,
                          basename: str = OUTPUT_BASENAME) -> list[tuple[str, str, bool]]:
     """
-    Merge new_entries into the existing chunk files, respecting the 5 MB limit.
+    Merge new_entries into the existing chunk files, respecting the 3 MB limit.
 
     Algorithm:
       1. Find the latest (highest-numbered) existing chunk file.
-      2. Download its current contents.
+      2. Download its current contents (with JSON validation/repair).
       3. Append new_entries one by one.  If adding an entry would push the
          file over MAX_BYTES, close the current chunk and open a new one.
       4. Return a list of (repo_path, json_string, is_modified) tuples —
@@ -629,12 +727,12 @@ def accumulate_and_split(new_entries: list,
 
     for entry in new_entries:
         trial = current_data + [entry]
-        trial_bytes = json.dumps(trial, indent=4, ensure_ascii=False).encode("utf-8")
+        trial_bytes = safe_json_dumps(trial).encode("utf-8")
 
         if len(trial_bytes) >= MAX_BYTES:
             # Current chunk is full — save it and open a new one
             if current_data:
-                content = json.dumps(current_data, indent=4, ensure_ascii=False)
+                content = safe_json_dumps(current_data)
                 results_to_commit.append((current_path, content, modified))
                 print(f"  Chunk full ({len(trial_bytes)/1024:.1f} KB would exceed {MAX_MB} MB) "
                       f"— closing {current_path} with {len(current_data)} entries.")
@@ -648,7 +746,7 @@ def accumulate_and_split(new_entries: list,
 
     # Final (possibly only) chunk
     if current_data and modified:
-        content = json.dumps(current_data, indent=4, ensure_ascii=False)
+        content = safe_json_dumps(current_data)
         results_to_commit.append((current_path, content, modified))
 
     return results_to_commit
@@ -682,6 +780,19 @@ def fetch_remote_text(path: str) -> str:
     return ""
 
 def commit_file(path: str, content: str, message: str) -> bool:
+    """
+    Commit content to path on GH_BRANCH.
+    For .json files, validates the content before committing so a corrupt
+    file is never pushed to the repo.
+    """
+    # Pre-commit JSON validation for .json files
+    if path.endswith(".json"):
+        try:
+            json.loads(content)
+        except json.JSONDecodeError as e:
+            print(f"  ✗ Refusing to commit {path} — content is not valid JSON: {e}")
+            return False
+
     url = f"{GH_API}/repos/{GH_REPO}/contents/{path}"
     sha = get_file_sha(path)
 
@@ -756,7 +867,7 @@ def extract_hianime_urls_from_400_file(lines: list[str]) -> set:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  MAIN
+#  RESOLVE SLICE
 # ═══════════════════════════════════════════════════════════════
 
 def resolve_slice(anime_list: list, skip_urls: set) -> tuple[int, int, str]:
@@ -809,8 +920,13 @@ def resolve_slice(anime_list: list, skip_urls: set) -> tuple[int, int, str]:
     return slice_start, slice_end, label
 
 
+# ═══════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════
+
 def main():
-    print(f"Repo:  {GH_REPO}  branch={GH_BRANCH}\n")
+    print(f"Repo:  {GH_REPO}  branch={GH_BRANCH}")
+    print(f"Output dir: {OUTPUT_DIR}/   |   Max file size: {MAX_MB} MB\n")
 
     # ── Fetch master list ──────────────────────────────────────
     print("Fetching master list from GitHub...")
@@ -882,9 +998,9 @@ def main():
 
     print(f"\n{len(verified_entries)} verified  |  {len(unverified_entries)} unverified.\n")
 
-    # ── Step 3: Accumulate into existing chunk files (≤5 MB) ──
+    # ── Step 3: Accumulate into existing chunk files (≤ 3 MB) ─
     print("=" * 55)
-    print("STEP 3 — Accumulating into output files (max 5 MB per file)")
+    print(f"STEP 3 — Accumulating into output files (max {MAX_MB} MB per file)")
     print("=" * 55)
 
     print(f"\n  [anime_data] {len(verified_entries)} verified entries →")
