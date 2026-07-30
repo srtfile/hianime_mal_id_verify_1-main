@@ -5043,5 +5043,27 @@
         "MAL_URL": "https://myanimelist.net/anime/11595",
         "Match_Score": "4/4",
         "Match_Note": "verified"
+    },
+    {
+        "ID": 5256,
+        "Title": "Naruto",
+        "HiAnime_URL": "https://hianime.ad/anime/naruto",
+        "Rating": "PG-13",
+        "Total Episodes": "220",
+        "Type": "TV",
+        "Release Year": "2002",
+        "Japanese": "NARUTO ナルト Naruto; Naruto",
+        "Aired": "Oct 3, 2002 to Feb 8, 2007",
+        "Premiered": "2002",
+        "Duration": "23",
+        "Status": "Finished Airing",
+        "Genres": "Action, Adventure, Comedy, Martial Arts, Shounen, Super Power",
+        "Studios": "Studio Pierrot",
+        "Producers": "Studio Pierrot",
+        "MAL_ID": 20,
+        "MAL_Title": "Naruto",
+        "MAL_URL": "https://myanimelist.net/anime/20",
+        "Match_Score": "4/4",
+        "Match_Note": "verified"
     }
 ]
